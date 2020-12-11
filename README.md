@@ -1,0 +1,1 @@
+In this UK Biobank analysis, we investigate the interaction between genetic variants and sex, obesity, T2D, and social determinants of health (SDH) on COVID-19 severity. By leveraging well-established COVID-19 risk factors as exposures, this approach has the potential to shed light on COVID-19 biology and inform the prediction of particularly susceptible individuals.
