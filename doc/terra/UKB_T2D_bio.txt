@@ -1,0 +1,21 @@
+## UK Biobank COVID T2D GxE Terra Workspace
+
+Through our UKB COVID and T2D GxE analysis, we will investigate the interaction between genetic variants and the impact of sex, obesity, T2D, and social determinants of health (SDH) on COVID-19 severity. In-depth interaction analysis leveraging known COVID-19 risk factors as exposures has the potential to uncover interactions that shed light on COVID-19 biology and inform the prediction of particularly susceptible individuals.
+
+In this workspace, we will store scripts and data relating to the UKB COVID and T2D GxE analysis. The workspace includes a set of notebooks where we will:
+
+* Store raw phenotype data and link to raw genotype data
+* Preprocess phenotype data to generate appropriate exposure and COVID outcome definitions
+* Run interaction testing workflows
+* Post-process and visualize results
+
+We define cases with COVID-19 severity as:
+
+* **Primary Analysis:** Laboratory confirmed SARS-COV-2 virus with hospitalization
+* **Secondary Analysis:** Laboratory confirmed SARS-COV-2 virus with hospitalization and respiratory support or mortality.
+
+To summarize and manipulate the GxE analysis results, we will use scripts written by Dr. Kenneth Westerman. Input summary statistics files will be primarily visualized using Manhattan and QQ plots.
+
+* [Github Repository] (https://github.com/large-scale-gxe-methods/gxe-utils)
+* [GxE Summarize GWIS README] (https://github.com/large-scale-gxe-methods/gxe-utils/blob/master/README.md)
+* [GxE R Markdown] (https://github.com/large-scale-gxe-methods/gxe-utils/blob/master/summarize_GWIS.Rmd)

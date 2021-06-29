@@ -1,0 +1,354 @@
+---
+output: html_document
+title: Genome-wide gene-environment interaction testing results summary
+params:
+  GEM_file: "path_to_GEM_file"
+  variant_id_col: "RSID"
+  chromosome_col: "CHR"
+  position_col: "POS"
+  ref_allele_col: "Non_Effect_Allele"
+  alt_allele_col: "Effect_Allele"
+  allele_freq_col: "AF"
+  maf_filter: 0
+  beta_interaction_col: "Beta_Interaction_1"
+  p_interaction_col: "P_Value_Interaction"
+  p_joint_col: "P_Value_Joint"
+  p_marginal_col: "P_Value_Marginal"
+  gw_threshold: 5e-8
+  prune_threshold_int: 1e-5
+  prune_threshold_joint: 5e-8
+  prune_locus_width: 500000
+---
+
+<!--
+Run using: rmarkdown::render("summarize_GWIS_MAF.Rmd", output_file="MDI_COVID_MAF.html",
+                              params=list(GEM_file="mdi_test.txt", variant_id_col="RSID",
+                              maf_filter= 0.05))
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE, dev="png", dpi=300)
+suppressMessages(silent <- lapply(
+  c("knitr", "kableExtra", "data.table", "tidyverse", "GenomicRanges"),
+  library, character.only=TRUE))
+theme_set(theme_bw())
+# # fix a unicode error
+# Sys.setlocale(category = "LC_ALL","C.UTF-8")
+```
+
+```{r load-sumstats}
+raw_sumstats_file <- params$GEM_file
+
+colname_translations <- c(  # Inputs define names for relevant columns
+  varID=params$variant_id_col, chr=params$chromosome_col, pos=params$position_col,
+  ref=params$ref_allele_col, alt=params$alt_allele_col,
+  af=params$allele_freq_col,
+  beta_int=params$beta_interaction_col,
+  p_int=params$p_interaction_col, p_joint=params$p_joint_col,
+  p_marg=params$p_marginal_col
+)
+
+read_sumstats <- function(ss_file) {
+  fread(ss_file, select=unname(colname_translations), 
+        data.table=FALSE, stringsAsFactors=FALSE) %>%
+    select(colname_translations[colname_translations %in% names(.)]) %>%
+    mutate(chr=ifelse(chr == "X", chr, as.character(as.integer(chr))))
+}
+
+if (grepl("\\*", raw_sumstats_file)) {  # Pattern was provided (multiple files, possibly per-chromosome)
+  ss_files <- system(paste("ls", raw_sumstats_file), intern=TRUE)  # Get vector of individual files from wildcard pattern
+  sumstats <- do.call(  # Read in all individual files and bind into a single dataset
+    bind_rows,
+    lapply(ss_files, read_sumstats)
+  )
+  out_path <- paste0(gsub("_chr\\*", "", raw_sumstats_file, ".txt"))
+  write_tsv(sumstats, out_path)  # Write merged summary statistic file
+  system(paste("gzip", out_path))
+} else {  # Single filename provided
+  sumstats <- read_sumstats(raw_sumstats_file)
+}
+
+if (!is.null(params$maf_filter)) {
+  sumstats <- filter(sumstats, pmin(af, 1 - af) > params$maf_filter)
+}
+```
+
+```{r pruning-functions}
+prune_chromosome <- function(chr_df, pval_col, locus_width) {
+  # Prune variants given a chromosome-specific summary statistic data frame
+  df <- arrange(chr_df, !!sym(pval_col))  # Sort by ascending p-value
+  pruned_df <- tibble()
+  while(nrow(df) > 0) {
+    pruned_df <- bind_rows(pruned_df, df[1, ])  # Add lowest p-value to pruned dataset
+    df <- filter(df, (pos < df$pos[1] - locus_width / 2) |  # Remove rest of variants in that distance-based locus
+                   (pos > df$pos[1] + locus_width / 2))
+  }
+  pruned_df
+}
+
+prune_variants <- function(ss_df, pval_col, locus_width=500000) {
+  # Prune variants across all chromosomes using a simple distance-based approach
+  ss_df %>%
+    nest(data=-chr) %>%
+    mutate(pruned_ss=map(data, prune_chromosome, pval_col, locus_width)) %>%
+    unnest(pruned_ss) %>%
+    select(-data) %>%
+    dplyr::rename(index_var=varID)
+}
+```
+
+```{r plotting-functions}
+make_manhattan <- function(data, pval_col, main="") {
+  mh_data <- data %>%
+    dplyr::rename(SNP=varID, CHR=chr, POS=pos, P=pval_col) %>%
+    filter(!is.na(P)) %>%
+    mutate(P = ifelse(P == 0, min(1e-300, min(P[P != 0], na.rm=TRUE)), P),  # Remove P = 0
+           nlp = -log10(P))
+  # Trim points in crowded regions (credit to RaMWAS package for code snippet)
+  yfac = as.integer(mh_data$nlp * 100) + 1L
+  yorder = sort.list(yfac)
+  yfac <- factor(yfac, levels=as.character(seq_len(max(yfac))))
+  ygroup <- split(seq_along(yfac), yfac)
+  for (i in seq_along(ygroup)) {
+    if (length(ygroup[[i]]) > 300) {
+      ygroup[[i]] <- sample(ygroup[[i]], size=300, replace=FALSE)
+    }
+  }
+  keep <- unlist(ygroup, use.names=FALSE)
+  mh_data <- mh_data %>%
+    select(SNP, CHR, POS, nlp) %>%
+    dplyr::slice(keep) %>%
+    mutate(POS = as.numeric(as.character(POS)),
+           CHR = factor(CHR, levels=1:22)) %>%
+    arrange(CHR, POS) %>%
+    mutate(pos_idx = seq(1, nrow(.)))
+  chr_lengths <- sapply(1:22, function(chr) with(mh_data, max(POS[CHR == chr])))
+  chr_lengths <- ifelse(is.infinite(chr_lengths), 0, chr_lengths)
+  chr_start_pos <- cumsum(chr_lengths) - chr_lengths
+  mh_data <- mh_data %>%
+    mutate(x_coord = chr_start_pos[CHR] + POS,
+           color = CHR,
+    ) %>%
+    arrange(as.integer(color), nlp) %>%
+    distinct(SNP, .keep_all=TRUE)
+  lims <- mh_data %>%
+    group_by(CHR) %>%
+    summarise(avg_coord = (min(x_coord) + max(x_coord)) / 2)
+  newcols <- setNames(
+    rep(x=c("#AAAAAA", "#8A8A8A"), length.out=22),  # Gray/dark gray for alternating chromosomes
+    levels(factor(lims$CHR))
+  )
+  plt <- ggplot() +
+    geom_point(data=mh_data, 
+               aes(x=x_coord, y=nlp, color=factor(color)), 
+               size=0.75, alpha=1) +
+    geom_hline(yintercept=-log10(5e-8), linetype="dashed", color="black") + 
+    scale_x_continuous(breaks=lims$avg_coord[c(1:16, 18, 20, 20, 22)], 
+                       labels=c(1:16, 18, 20, 20, 22), 
+                       expand=c(0,0)) +
+    scale_y_continuous(name=expression(-log[10](italic(p)))) +
+    scale_colour_manual(values=newcols, guide=FALSE) +
+    scale_fill_manual(name="Color", values=newcols) +
+    labs(title=main, x="Chromosome") +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_text(vjust = -1.5),
+          panel.grid.minor=element_blank(),
+          panel.grid.major.x=element_blank())
+  plt
+}
+
+calc_lambda <- function(x, p=0.5){
+  # Calculate genomic inflation lambda value
+  x = x[!is.na(x)]
+  x.quantile <- quantile(x, p)
+  round(qchisq(1 - x.quantile, 1) / qchisq(p, 1), 2)
+}
+
+make_qq <- function(data, pval_col, main=""){
+  # Make a quantile-quantile plot
+  data <- filter(data, data[[pval_col]] > 0)  # In case extremely low p-values are stored as zero
+  
+  # Process p-values
+  y_vals <- sort(-log10(data[[pval_col]]))
+  x_vals <- -log10(rev(ppoints(length(y_vals))))  # ppoints generates a uniform probability distribution
+  
+  # Trim points at higher p-values (credit to RaMWAS package for code snippet)
+  levels = as.integer((x_vals - x_vals[1]) / (tail(x_vals, 1) - x_vals[1]) * 2000)
+  keep = c(TRUE, diff(levels) != 0)
+  levels = as.integer((y_vals - y_vals[1])/(tail(y_vals, 1) - y_vals[1]) * 2000)
+  keep = keep | c(TRUE, diff(levels) != 0)
+  keep = which(keep)
+  
+  par(ps=18)
+  plot(x=x_vals[keep], y=y_vals[keep], 
+       xlab=expression(-log[10](italic(p)) * " (Expected)"), 
+       ylab=expression(-log[10](italic(p)) * " (Observed)"),
+       main=main, cex=0.8, 
+       cex.lab=0.8, cex.main=0.9, 
+       pch=16, ylim=c(0, ceiling(max(y_vals))))
+  abline(0, 1, lty=2)
+
+  legend(x='topleft', y='topleft',
+         bquote(lambda == .(calc_lambda(data[[pval_col]]))), 
+         cex=0.9, bty="n")
+}
+```
+
+## Summary Manhattan plots
+
+* Dotted line corresponds to genome-wide significance (p = 5e-8)
+* "Joint" corresponds to the joint test of genetic main and interaction effect
+* "Marginal" corresponds to the genetic main effect from a model adjusted for the exposure but not including a genetic interaction term
+
+```{r manhattan, fig.asp=0.5}
+par(mar=c(2, 6, 4, 1), mfrow=c(3, 1))
+#make_manhattan(sumstats, pval_col="p_int", main="Interaction")
+#make_manhattan(sumstats, pval_col="p_joint", main="Joint")
+#make_manhattan(sumstats, pval_col="p_marg", main="Marginal")
+```
+
+## Interaction test
+
+* A simple distance-based pruning method is used here, with total window size of `r params$prune_locus_width / 1000` kb (`r params$prune_locus_width / 1000 / 2` kb on each side).
+
+```{r interaction-qq, out.width="70%"}
+#par(mar=c(5, 5, 4, 2))
+#make_qq(sumstats, "p_int", "QQ plot for interaction test")
+```
+
+```{r interaction-loci}
+#if (min(sumstats$p_int, na.rm=TRUE) > as.numeric(params$prune_threshold_int)) {
+#  print("Skipping interaction pruning (no variants below pruning threshold)")
+#} else {
+#  sumstats_int_pruned <- sumstats %>%
+#    filter(p_int < as.numeric(params$prune_threshold_int)) %>%
+#    prune_variants("p_int", as.integer(params$prune_locus_width))
+
+#   sumstats_int_pruned %>%
+#     mutate(gw_int=p_int < 5e-8,
+#            gw_marg=p_marg < 5e-8,
+#            index_var=strtrim(index_var, 30)) %>%
+#     select(index_var, chr, pos, P_int=p_int, `G-W interaction effect`=gw_int,
+#            P_joint=p_joint, P_marginal=p_marg) %>%
+#     kable(booktabs=TRUE, longtable=TRUE,
+#           caption="Interaction test loci") %>%
+#     kable_styling(latex_options="scale_down") %>%
+#     column_spec(1, width="10cm")
+# }
+######################################
+
+    sumstats_marg_pruned <- sumstats %>% 
+      filter(p_marg < as.numeric(params$prune_threshold_int)) %>%
+      prune_variants("p_int", as.integer(params$prune_locus_width))
+      
+    sumstats_marg_pruned %>%
+      mutate (gw_marg=p_marg < 5e-8,
+              index_var=strtrim(index_var, 30)) %>%
+        select(index_var, chr, pos, P_marginal=p_marg) %>%
+        kable(booktabs=TRUE, longtable=TRUE,
+              caption="Marginal test loci") %>%
+        kable_styling(latex_options="scale_down") %>%
+        column_spec(1, width="10cm")
+
+```
+
+
+
+## Joint test
+
+```{r joint-qq, out.width="70%"}
+# par(mar=c(5, 5, 4, 2))
+# make_qq(sumstats, "p_joint", "QQ plot for joint test")
+```
+
+```{r joint-plot, fig.asp=0.6}
+# make_joint_plot <- function(data,
+#                             boundary_marg=as.numeric(params$gw_threshold), 
+#                             boundary_joint=as.numeric(params$gw_threshold),
+#                             min_p_marg=NULL, max_p_joint=0.001, main=""){
+#   
+#   if (is.null(min_p_marg)) min_p_marg <- min(data$p_marg)
+#   
+#   data <- data %>%
+#     filter(p_marg != 0,
+#            p_joint != 0,
+#            p_marg >= min_p_marg,  # Easier visualization of the "borderline" variants we care about here
+#            p_joint <= max_p_joint) %>%  # Filter p-values for computational efficiency
+#     mutate(nlp_marg=-log10(p_marg),
+#            nlp_joint=-log10(p_joint),
+#            nlp_int=-log10(p_int),
+#            highlight=factor(nlp_int > -log10(5e-8), levels=c(F, T)))
+#   
+#   # keep <- sample(which(data$p_marg < 1e-4 & data$p_joint < 1e-4), size=100)
+#   
+#   nlp_theoretical <- -log10(
+#     pchisq(qchisq(10 ** (-data$nlp_marg), df=1, lower.tail=FALSE), 
+#            df=2, lower.tail=FALSE)
+#   )
+#   
+#   ggplot(data, aes(x=nlp_marg, y=nlp_joint, color=highlight)) +
+#     geom_point() +
+#     geom_vline(xintercept=-log10(boundary_marg), linetype="dotted") +
+#     geom_hline(yintercept=-log10(boundary_joint), linetype="dotted") +
+#     geom_line(aes(y=nlp_theoretical), linetype="dashed", color="black") +
+#     scale_color_manual(name="Genome-wide\nsignificant\ninteraction test", 
+#                        values=c("gray", "chocolate"), labels=c("No", "Yes"),
+#                        drop=FALSE) +
+#     labs(x=expression(-log[10](italic(p)) * " for marginal test"),
+#          y=expression(-log[10](italic(p)) * " for joint test"),
+#          title=main)
+# }
+# 
+# make_joint_plot(sumstats)
+```
+
+```{r joint-loci}
+# if (min(sumstats$p_joint, na.rm=TRUE) > as.numeric(params$prune_threshold_joint)) {
+#   print("Skipping joint pruning (no variants below pruning threshold)")
+# } else {
+#   sumstats_joint_pruned <- sumstats %>%
+#     filter(p_joint < as.numeric(params$prune_threshold_joint)) %>%
+#     prune_variants("p_joint", as.numeric(params$prune_locus_width))
+#   
+#   joint_locus_tbl <- sumstats_joint_pruned %>%
+#     mutate(gw_joint=p_joint < 5e-8,
+#            gw_marg=p_marg < 5e-8,
+#            index_var=strtrim(index_var, 30)) %>%
+#     select(index_var, chr, pos, P_joint=p_joint, `Genome-wide joint locus`=gw_joint,
+#            `Genome-wide marginal locus`=gw_marg)
+#   
+#   
+#   if (nrow(joint_locus_tbl) == 0) {  # No joint loci? Print message.
+#     print("No genome-wide loci uncovered using the joint test.")
+#   } else if (nrow(joint_locus_tbl) < 50) {  # <50 joint loci? Print info for each locus
+#     joint_locus_tbl <- joint_locus_tbl %>% mutate(P_joint = as.character(format(P_joint, digits=3, scientific=TRUE)))
+#     kable(joint_locus_tbl,booktabs=TRUE, longtable=TRUE, 
+#           caption="Joint test loci") %>%
+#       kable_styling(latex_options="scale_down", full_width=FALSE)
+#   } else {  # >=50 joint loci? Print counts of joint/marginal overlap
+#     joint_locus_cnt_tbl <- tibble(
+#       c("In a marginal genetic effect locus",
+#         "Not in a marginal genetic effect locus"),
+#       c(sum(joint_locus_tbl$`Genome-wide marginal locus`),
+#         sum(!joint_locus_tbl$`Genome-wide marginal locus`))
+#     ) %>%
+#       setNames(c("", "Joint test locus count"))
+#     kable(joint_locus_cnt_tbl, booktabs=TRUE, longtable=TRUE,
+#           caption="Count of genome-wide significant joint test loci") %>%
+#      kable_styling(latex_options="scale_down", full_width=FALSE) %>%
+#     column_spec(1, width="10cm")
+#   }
+# }
+# 
+
+```
+
+--------------------------------------------------------------------------------
+
+```{r dump-parameters}
+tibble(Parameter=names(params),
+       Value=unlist(params)) %>%
+  kable(booktabs=TRUE,
+        caption="Summarization report parameters") %>%
+  kable_styling(full_width=FALSE)
+```
